@@ -189,7 +189,8 @@ analyzeBtn.addEventListener('click', async () => {
     const oldCount = oldStrings.length; const newCount = newStrings.length; const oldSize = oldBuf.byteLength; const newSize = newBuf.byteLength;
     statsDiv.innerHTML = `<div class="row"><div class="col"><strong>Old file:</strong> ${fileOld.files[0].name} — ${oldSize} bytes — ${oldCount} printable sequences</div><div class="col"><strong>New file:</strong> ${fileNew.files[0].name} — ${newSize} bytes — ${newCount} printable sequences</div></div>`;
 
-    function previewStrings(arr, limit){ const shown = arr.slice(0, limit).map((o,i)=>`${i+1}. [${o.start}] (${o.length}) ${o.string}`); return shown.join('\n'); }
+    function previewStrings(arr, limit){ const shown = arr.slice(0, limit).map((o,i)=>`${i+1}. [${o.start}] (${o.length}) ${o.string}`); return shown.join('
+'); }
     oldPreview.textContent = previewStrings(oldStrings, maxPreview);
     newPreview.textContent = previewStrings(newStrings, maxPreview);
 
