@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Gorilla Tag Metadata Safe Merger (HTML)</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial;margin:18px;background:#f6f7fb;color:#111}
+    .card{background:#fff;border-radius:12px;padding:16px;box-shadow:0 6px 18px rgba(20,20,40,0.06);max-width:980px;margin:12px auto}
+    h1{font-size:20px;margin:0 0 8px}
+    label{display:block;margin:12px 0 6px;font-weight:600}
+    input[type=file]{display:block}
+    button{background:#1f6feb;color:white;border:0;padding:10px 14px;border-radius:8px;cursor:pointer}
+    pre{background:#0b1221;color:#e6eef8;padding:12px;border-radius:8px;overflow:auto}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:6px 8px;border-bottom:1px solid #eee;text-align:left}
+    .muted{color:#666;font-size:13px}
+    .row{display:flex;gap:12px}
+    .col{flex:1}
+    .small{font-size:13px}
+    .success{color:green}
+    .danger{color:#b00020}
+    .inline{display:inline-block;margin-right:8px}
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Gorilla Tag Metadata — Safe In-place Merger (HTML)</h1>
+    <p class="muted">Upload your <strong>old modified</strong> metadata and your <strong>new unmodified</strong> metadata. This tool attempts a conservative, in-place-only merge: it will only overwrite existing slots or null runs in the new file to preserve offsets (no file-growth, no pointer patching).</p>
+
+    <label>Old (modified) metadata file</label>
+    <input id="fileOld" type="file" accept="*/*" />
+
+    <label>New (unmodified) metadata file</label>
+    <input id="fileNew" type="file" accept="*/*" />
+
+    <div class="row">
+      <div class="col">
+        <label>Minimum printable length</label>
+        <input id="minLen" type="number" value="4" min="1" style="width:100px" />
+      </div>
+      <div class="col">
+        <label>Max preview strings</label>
+        <input id="maxPreview" type="number" value="200" min="10" style="width:100px" />
+      </div>
+      <div class="col small">
+        <label>&nbsp;</label>
+        <button id="analyzeBtn">Analyze files</button>
+      </div>
+    </div>
+
+    <div id="analysis" style="margin-top:12px;display:none">
+      <h3>Analysis</h3>
+      <div id="stats"></div>
+      <p class="muted">Note: This tool treats printable bytes as 0x20..0x7E (ASCII printable). Encoding is preserved using latin1 (1:1 byte mapping).</p>
+      <div style="display:flex;gap:12px">
+        <div style="flex:1">
+          <h4>Old file — printable strings (preview)</h4>
+          <pre id="oldPreview" style="height:220px"></pre>
+        </div>
+        <div style="flex:1">
+          <h4>New file — printable strings (preview)</h4>
+          <pre id="newPreview" style="height:220px"></pre>
+        </div>
+      </div>
+
+      <div style="margin-top:10px">
+        <button id="mergeBtn">Run conservative in-place merge</button>
+        <span id="mergeResult" style="margin-left:12px"></span>
+      </div>
+
+      <div id="reportBox" style="margin-top:12px;display:none">
+        <h3>Merge report</h3>
+        <div id="reportSummary"></div>
+        <p><a id="downloadMerged" href="#" download="merged-metadata.dat" style="display:none">Download merged file</a> <a id="downloadReport" href="#" download="merge-report.json" style="display:none">Download report (JSON)</a></p>
+        <h4>Failed strings (need manual handling)</h4>
+        <pre id="failedList" style="height:220px;overflow:auto"></pre>
+      </div>
+    </div>
+
+  </div>
+
+<script>
+// Utility: read file as ArrayBuffer
+function readFileBuf(file){
+  return new Promise((res, rej) => {
+    const fr = new FileReader();
+    fr.onload = () => res(fr.result);
+    fr.onerror = rej;
+    fr.readAsArrayBuffer(file);
+  })
+}
+
+// Extract printable ASCII sequences 0x20..0x7E of length >= minLen
+function extractPrintableSlots(buf, minLen){
+  const bytes = new Uint8Array(buf);
+  const slots = [];
+  let i = 0, start = -1, len = 0;
+  while(i < bytes.length){
+    const b = bytes[i];
+    if(b >= 0x20 && b <= 0x7E){
+      if(start === -1) start = i;
+      len++;
+    } else {
+      if(start !== -1 && len >= minLen){
+        slots.push({start: start, end: i, length: len});
+      }
+      start = -1; len = 0;
+    }
+    i++;
+  }
+  if(start !== -1 && len >= minLen) slots.push({start: start, end: bytes.length, length: len});
+  return slots;
+}
+
+// Find null runs \x00 of minLen
+function findNullSlots(buf, minLen){
+  const bytes = new Uint8Array(buf);
+  const slots = [];
+  let i = 0, start = -1, len = 0;
+  while(i < bytes.length){
+    const b = bytes[i];
+    if(b === 0x00){
+      if(start === -1) start = i;
+      len++;
+    } else {
+      if(start !== -1 && len >= minLen){
+        slots.push({start: start, end: i, length: len});
+      }
+      start = -1; len = 0;
+    }
+    i++;
+  }
+  if(start !== -1 && len >= minLen) slots.push({start: start, end: bytes.length, length: len});
+  return slots;
+}
+
+// Read printable strings and their positions, decode with latin1 (1:1)
+function getPrintableStrings(buf, minLen){
+  const bytes = new Uint8Array(buf);
+  const decoder = new TextDecoder('latin1');
+  const arr = [];
+  let i = 0, start = -1, len = 0;
+  while(i < bytes.length){
+    const b = bytes[i];
+    if(b >= 0x20 && b <= 0x7E){
+      if(start === -1) start = i;
+      len++;
+    } else {
+      if(start !== -1 && len >= minLen){
+        const slice = bytes.subarray(start, i);
+        arr.push({string: decoder.decode(slice), start: start, length: len});
+      }
+      start = -1; len = 0;
+    }
+    i++;
+  }
+  if(start !== -1 && len >= minLen){
+    const slice = bytes.subarray(start, bytes.length);
+    const decoder = new TextDecoder('latin1');
+    arr.push({string: decoder.decode(slice), start: start, length: len});
+  }
+  return arr;
+}
+
+function arrayBufferToBlobLink(buffer, filename){
+  const blob = new Blob([buffer]);
+  const url = URL.createObjectURL(blob);
+  return {url, blob, filename};
+}
+
+// UI and logic
+const fileOld = document.getElementById('fileOld');
+const fileNew = document.getElementById('fileNew');
+const analyzeBtn = document.getElementById('analyzeBtn');
+const minLenInput = document.getElementById('minLen');
+const maxPreviewInput = document.getElementById('maxPreview');
+const analysisDiv = document.getElementById('analysis');
+const statsDiv = document.getElementById('stats');
+const oldPreview = document.getElementById('oldPreview');
+const newPreview = document.getElementById('newPreview');
+const mergeBtn = document.getElementById('mergeBtn');
+const mergeResult = document.getElementById('mergeResult');
+const reportBox = document.getElementById('reportBox');
+const reportSummary = document.getElementById('reportSummary');
+const failedList = document.getElementById('failedList');
+const downloadMerged = document.getElementById('downloadMerged');
+const downloadReport = document.getElementById('downloadReport');
+
+let oldBuf = null, newBuf = null;
+let oldStrings = [], newStrings = [];
+
+analyzeBtn.addEventListener('click', async () => {
+  if(!fileOld.files[0] || !fileNew.files[0]){
+    alert('Please choose both files.');
+    return;
+  }
+  const minLen = Math.max(1, parseInt(minLenInput.value)||4);
+  const maxPreview = Math.max(10, parseInt(maxPreviewInput.value)||200);
+
+  analysisDiv.style.display = 'none';
+  reportBox.style.display = 'none';
+  mergeResult.textContent = '';
+
+  oldBuf = await readFileBuf(fileOld.files[0]);
+  newBuf = await readFileBuf(fileNew.files[0]);
+
+  oldStrings = getPrintableStrings(oldBuf, minLen);
+  newStrings = getPrintableStrings(newBuf, minLen);
+
+  const oldCount = oldStrings.length;
+  const newCount = newStrings.length;
+  const oldSize = oldBuf.byteLength;
+  const newSize = newBuf.byteLength;
+
+  statsDiv.innerHTML = `<div class="row"><div class="col"><strong>Old file:</strong> ${fileOld.files[0].name} — ${oldSize} bytes — ${oldCount} printable sequences</div><div class="col"><strong>New file:</strong> ${fileNew.files[0].name} — ${newSize} bytes — ${newCount} printable sequences</div></div>`;
+
+  // Preview
+  function previewStrings(arr, limit){
+    const shown = arr.slice(0, limit).map((o,i)=>`${i+1}. [${o.start}] (${o.length}) ${o.string}`);
+    return shown.join('\n');
+  }
+  oldPreview.textContent = previewStrings(oldStrings, maxPreview);
+  newPreview.textContent = previewStrings(newStrings, maxPreview);
+
+  analysisDiv.style.display = 'block';
+});
+
+mergeBtn.addEventListener('click', async () => {
+  if(!oldBuf || !newBuf){ alert('Run analysis first.'); return; }
+  const minLen = Math.max(1, parseInt(minLenInput.value)||4);
+
+  mergeResult.textContent = 'Running...';
+
+  // Build sets for quick membership
+  const newSet = new Set(newStrings.map(o=>o.string));
+
+  // Carry strings: present in old but not in new
+  const carry = oldStrings.filter(o => !newSet.has(o.string));
+
+  // Find null slots and printable slots in new
+  const nullSlots = findNullSlots(newBuf, minLen).sort((a,b) => a.length - b.length);
+  const printableSlots = extractPrintableSlots(newBuf, minLen).map(s => ({start:s.start,end:s.end,length:s.length})).sort((a,b)=>a.length-b.length);
+
+  const assignments = [];
+  const failures = [];
+
+  const decoder = new TextDecoder('latin1');
+  const encoder = new TextEncoder('utf-8'); // but we will create latin1 bytes manually
+
+  // helper to get latin1 bytes for a string
+  function latin1Bytes(str){
+    // in JS, use codePointAt for each char and map to a byte 0..255
+    const arr = new Uint8Array(str.length);
+    for(let i=0;i<str.length;i++){
+      const cp = str.charCodeAt(i) & 0xFF;
+      arr[i] = cp;
+    }
+    return arr;
+  }
+
+  // iterate carry strings and attempt to assign
+  for(const item of carry){
+    const s = item.string;
+    const sbytes = latin1Bytes(s);
+    let assigned = false;
+
+    // 1) find null slot >= len(s)+1 (for trailing null)
+    for(let i=0;i<nullSlots.length;i++){
+      const slot = nullSlots[i];
+      if(slot.length >= sbytes.length + 1){
+        assignments.push({string:s, bytes:concatUint8(sbytes, new Uint8Array([0])), start: slot.start, slot_len: slot.length});
+        nullSlots.splice(i,1);
+        assigned = true;
+        break;
+      }
+    }
+    if(assigned) continue;
+
+    // 2) find printable slot length >= sbytes.length
+    for(let i=0;i<printableSlots.length;i++){
+      const slot = printableSlots[i];
+      if(slot.length >= sbytes.length){
+        const padded = new Uint8Array(slot.length);
+        padded.set(sbytes);
+        // pad remainder with 0
+        assignments.push({string:s, bytes:padded, start: slot.start, slot_len: slot.length});
+        printableSlots.splice(i,1);
+        assigned = true;
+        break;
+      }
+    }
+
+    if(!assigned){
+      failures.push({string:s, length: sbytes.length});
+    }
+  }
+
+  // Apply assignments to a copy of newBuf
+  const merged = new Uint8Array(newBuf.slice(0));
+  for(const a of assignments){
+    for(let i=0;i<a.bytes.length;i++) merged[a.start + i] = a.bytes[i];
+    // zero out remainder if slot bigger than bytes
+    for(let j=a.bytes.length;j<a.slot_len;j++) merged[a.start + j] = 0;
+  }
+
+  // Build report
+  const report = {
+    old_file: fileOld.files[0].name,
+    new_file: fileNew.files[0].name,
+    merged_size: merged.byteLength,
+    applied_count: assignments.length,
+    failed_count: failures.length,
+    applied: assignments.map(a => ({string: a.string, start: a.start, slot_len: a.slot_len})),
+    failed: failures
+  };
+
+  // Make download links
+  const mergedLink = arrayBufferToBlobLink(merged.buffer, 'merged-metadata.dat');
+  const reportBlob = new Blob([JSON.stringify(report, null, 2)], {type:'application/json'});
+  const reportUrl = URL.createObjectURL(reportBlob);
+
+  downloadMerged.href = mergedLink.url;
+  downloadMerged.style.display = 'inline-block';
+  downloadMerged.download = 'merged-metadata.dat';
+  downloadReport.href = reportUrl;
+  downloadReport.style.display = 'inline-block';
+  downloadReport.download = 'merge-report.json';
+
+  // Show summary
+  reportBox.style.display = 'block';
+  reportSummary.innerHTML = `<div><strong>Applied:</strong> ${report.applied_count} strings — <strong>Failed:</strong> ${report.failed_count} strings</div>`;
+  failedList.textContent = report.failed.slice(0,1000).map((f,i)=>`${i+1}. (${f.length}) ${f.string ?? '[binary]'}`).join('\n');
+
+  mergeResult.textContent = 'Done.';
+});
+
+// helpers
+function concatUint8(a,b){
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a,0); out.set(b,a.length);
+  return out;
+}
+
+</script>
+</body>
+</html>
