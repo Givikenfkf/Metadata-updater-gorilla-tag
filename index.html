@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Gorilla Tag Metadata Safe Merger (HTML)</title>
+  <title>Gorilla Tag Metadata Safe Merger (HTML) — Improved</title>
   <style>
     body{font-family:system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial;margin:18px;background:#f6f7fb;color:#111}
     .card{background:#fff;border-radius:12px;padding:16px;box-shadow:0 6px 18px rgba(20,20,40,0.06);max-width:980px;margin:12px auto}
@@ -25,8 +25,8 @@
 </head>
 <body>
   <div class="card">
-    <h1>Gorilla Tag Metadata — Safe In-place Merger (HTML)</h1>
-    <p class="muted">Upload your <strong>old modified</strong> metadata and your <strong>new unmodified</strong> metadata. This tool attempts a conservative, in-place-only merge: it will only overwrite existing slots or null runs in the new file to preserve offsets (no file-growth, no pointer patching).</p>
+    <h1>Gorilla Tag Metadata — Safe In-place Merger (Improved)</h1>
+    <p class="muted">You said the merged file lets the game start briefly then crash. That's usually caused by overwriting bytes that should be preserved (pointer tables, checksums, or trailing bytes). This improved version preserves tail bytes inside a slot and creates a downloadable backup of the original new file so you can compare.</p>
 
     <label>Old (modified) metadata file</label>
     <input id="fileOld" type="file" accept="*/*" />
@@ -49,10 +49,15 @@
       </div>
     </div>
 
+    <div style="margin-top:10px">
+      <label class="inline"><input type="checkbox" id="preserveTail" checked /> Preserve tail bytes inside overwritten slots (recommended)</label>
+      <label class="inline"><input type="checkbox" id="backupNew" checked /> Offer backup download of the original new file</label>
+    </div>
+
     <div id="analysis" style="margin-top:12px;display:none">
       <h3>Analysis</h3>
       <div id="stats"></div>
-      <p class="muted">Note: This tool treats printable bytes as 0x20..0x7E (ASCII printable). Encoding is preserved using latin1 (1:1 byte mapping).</p>
+      <p class="muted">This tool treats printable bytes as 0x20..0x7E and uses latin1 for 1:1 byte mapping. If your metadata uses UTF-8 or custom encodings, use the advanced workflow.</p>
       <div style="display:flex;gap:12px">
         <div style="flex:1">
           <h4>Old file — printable strings (preview)</h4>
@@ -72,16 +77,22 @@
       <div id="reportBox" style="margin-top:12px;display:none">
         <h3>Merge report</h3>
         <div id="reportSummary"></div>
-        <p><a id="downloadMerged" href="#" download="merged-metadata.dat" style="display:none">Download merged file</a> <a id="downloadReport" href="#" download="merge-report.json" style="display:none">Download report (JSON)</a></p>
+        <p>
+          <a id="downloadBackup" href="#" download style="display:none">Download original new file (backup)</a>
+          <a id="downloadMerged" href="#" download="merged-metadata.dat" style="display:none">Download merged file</a>
+          <a id="downloadReport" href="#" download="merge-report.json" style="display:none">Download report (JSON)</a>
+        </p>
         <h4>Failed strings (need manual handling)</h4>
         <pre id="failedList" style="height:220px;overflow:auto"></pre>
+        <h4 style="margin-top:10px">Quick debug (hex around first applied change)</h4>
+        <pre id="hexDebug" style="height:160px;overflow:auto"></pre>
       </div>
     </div>
 
   </div>
 
 <script>
-// Utility: read file as ArrayBuffer
+// Same helpers as before, but improved apply logic: only overwrite the exact bytes you need and preserve remainder inside the slot (unless unchecked).
 function readFileBuf(file){
   return new Promise((res, rej) => {
     const fr = new FileReader();
@@ -90,52 +101,26 @@ function readFileBuf(file){
     fr.readAsArrayBuffer(file);
   })
 }
-
-// Extract printable ASCII sequences 0x20..0x7E of length >= minLen
 function extractPrintableSlots(buf, minLen){
   const bytes = new Uint8Array(buf);
   const slots = [];
   let i = 0, start = -1, len = 0;
   while(i < bytes.length){
     const b = bytes[i];
-    if(b >= 0x20 && b <= 0x7E){
-      if(start === -1) start = i;
-      len++;
-    } else {
-      if(start !== -1 && len >= minLen){
-        slots.push({start: start, end: i, length: len});
-      }
-      start = -1; len = 0;
-    }
-    i++;
-  }
+    if(b >= 0x20 && b <= 0x7E){ if(start === -1) start = i; len++; } else { if(start !== -1 && len >= minLen) slots.push({start: start, end: i, length: len}); start = -1; len = 0; } i++; }
   if(start !== -1 && len >= minLen) slots.push({start: start, end: bytes.length, length: len});
   return slots;
 }
-
-// Find null runs \x00 of minLen
 function findNullSlots(buf, minLen){
   const bytes = new Uint8Array(buf);
   const slots = [];
   let i = 0, start = -1, len = 0;
   while(i < bytes.length){
     const b = bytes[i];
-    if(b === 0x00){
-      if(start === -1) start = i;
-      len++;
-    } else {
-      if(start !== -1 && len >= minLen){
-        slots.push({start: start, end: i, length: len});
-      }
-      start = -1; len = 0;
-    }
-    i++;
-  }
+    if(b === 0x00){ if(start === -1) start = i; len++; } else { if(start !== -1 && len >= minLen) slots.push({start: start, end: i, length: len}); start = -1; len = 0; } i++; }
   if(start !== -1 && len >= minLen) slots.push({start: start, end: bytes.length, length: len});
   return slots;
 }
-
-// Read printable strings and their positions, decode with latin1 (1:1)
 function getPrintableStrings(buf, minLen){
   const bytes = new Uint8Array(buf);
   const decoder = new TextDecoder('latin1');
@@ -143,33 +128,12 @@ function getPrintableStrings(buf, minLen){
   let i = 0, start = -1, len = 0;
   while(i < bytes.length){
     const b = bytes[i];
-    if(b >= 0x20 && b <= 0x7E){
-      if(start === -1) start = i;
-      len++;
-    } else {
-      if(start !== -1 && len >= minLen){
-        const slice = bytes.subarray(start, i);
-        arr.push({string: decoder.decode(slice), start: start, length: len});
-      }
-      start = -1; len = 0;
-    }
-    i++;
-  }
-  if(start !== -1 && len >= minLen){
-    const slice = bytes.subarray(start, bytes.length);
-    const decoder = new TextDecoder('latin1');
-    arr.push({string: decoder.decode(slice), start: start, length: len});
-  }
+    if(b >= 0x20 && b <= 0x7E){ if(start === -1) start = i; len++; } else { if(start !== -1 && len >= minLen){ const slice = bytes.subarray(start, i); arr.push({string: decoder.decode(slice), start: start, length: len}); } start = -1; len = 0; } i++; }
+  if(start !== -1 && len >= minLen){ const slice = bytes.subarray(start, bytes.length); arr.push({string: decoder.decode(slice), start: start, length: len}); }
   return arr;
 }
+function arrayBufferToBlobLink(buffer, filename){ const blob = new Blob([buffer]); const url = URL.createObjectURL(blob); return {url, blob, filename}; }
 
-function arrayBufferToBlobLink(buffer, filename){
-  const blob = new Blob([buffer]);
-  const url = URL.createObjectURL(blob);
-  return {url, blob, filename};
-}
-
-// UI and logic
 const fileOld = document.getElementById('fileOld');
 const fileNew = document.getElementById('fileNew');
 const analyzeBtn = document.getElementById('analyzeBtn');
@@ -185,22 +149,18 @@ const reportBox = document.getElementById('reportBox');
 const reportSummary = document.getElementById('reportSummary');
 const failedList = document.getElementById('failedList');
 const downloadMerged = document.getElementById('downloadMerged');
+const downloadBackup = document.getElementById('downloadBackup');
 const downloadReport = document.getElementById('downloadReport');
+const hexDebug = document.getElementById('hexDebug');
 
 let oldBuf = null, newBuf = null;
 let oldStrings = [], newStrings = [];
 
 analyzeBtn.addEventListener('click', async () => {
-  if(!fileOld.files[0] || !fileNew.files[0]){
-    alert('Please choose both files.');
-    return;
-  }
+  if(!fileOld.files[0] || !fileNew.files[0]){ alert('Please choose both files.'); return; }
   const minLen = Math.max(1, parseInt(minLenInput.value)||4);
   const maxPreview = Math.max(10, parseInt(maxPreviewInput.value)||200);
-
-  analysisDiv.style.display = 'none';
-  reportBox.style.display = 'none';
-  mergeResult.textContent = '';
+  analysisDiv.style.display = 'none'; reportBox.style.display = 'none'; mergeResult.textContent = '';
 
   oldBuf = await readFileBuf(fileOld.files[0]);
   newBuf = await readFileBuf(fileNew.files[0]);
@@ -208,140 +168,111 @@ analyzeBtn.addEventListener('click', async () => {
   oldStrings = getPrintableStrings(oldBuf, minLen);
   newStrings = getPrintableStrings(newBuf, minLen);
 
-  const oldCount = oldStrings.length;
-  const newCount = newStrings.length;
-  const oldSize = oldBuf.byteLength;
-  const newSize = newBuf.byteLength;
-
+  const oldCount = oldStrings.length; const newCount = newStrings.length; const oldSize = oldBuf.byteLength; const newSize = newBuf.byteLength;
   statsDiv.innerHTML = `<div class="row"><div class="col"><strong>Old file:</strong> ${fileOld.files[0].name} — ${oldSize} bytes — ${oldCount} printable sequences</div><div class="col"><strong>New file:</strong> ${fileNew.files[0].name} — ${newSize} bytes — ${newCount} printable sequences</div></div>`;
 
-  // Preview
-  function previewStrings(arr, limit){
-    const shown = arr.slice(0, limit).map((o,i)=>`${i+1}. [${o.start}] (${o.length}) ${o.string}`);
-    return shown.join('\n');
-  }
+  function previewStrings(arr, limit){ const shown = arr.slice(0, limit).map((o,i)=>`${i+1}. [${o.start}] (${o.length}) ${o.string}`); return shown.join('
+'); }
   oldPreview.textContent = previewStrings(oldStrings, maxPreview);
   newPreview.textContent = previewStrings(newStrings, maxPreview);
-
   analysisDiv.style.display = 'block';
 });
 
 mergeBtn.addEventListener('click', async () => {
   if(!oldBuf || !newBuf){ alert('Run analysis first.'); return; }
   const minLen = Math.max(1, parseInt(minLenInput.value)||4);
-
+  const preserveTail = document.getElementById('preserveTail').checked;
+  const offerBackup = document.getElementById('backupNew').checked;
   mergeResult.textContent = 'Running...';
 
-  // Build sets for quick membership
   const newSet = new Set(newStrings.map(o=>o.string));
-
-  // Carry strings: present in old but not in new
   const carry = oldStrings.filter(o => !newSet.has(o.string));
-
-  // Find null slots and printable slots in new
   const nullSlots = findNullSlots(newBuf, minLen).sort((a,b) => a.length - b.length);
   const printableSlots = extractPrintableSlots(newBuf, minLen).map(s => ({start:s.start,end:s.end,length:s.length})).sort((a,b)=>a.length-b.length);
 
   const assignments = [];
   const failures = [];
 
-  const decoder = new TextDecoder('latin1');
-  const encoder = new TextEncoder('utf-8'); // but we will create latin1 bytes manually
+  function latin1Bytes(str){ const arr = new Uint8Array(str.length); for(let i=0;i<str.length;i++){ arr[i] = str.charCodeAt(i) & 0xFF; } return arr; }
 
-  // helper to get latin1 bytes for a string
-  function latin1Bytes(str){
-    // in JS, use codePointAt for each char and map to a byte 0..255
-    const arr = new Uint8Array(str.length);
-    for(let i=0;i<str.length;i++){
-      const cp = str.charCodeAt(i) & 0xFF;
-      arr[i] = cp;
-    }
-    return arr;
-  }
-
-  // iterate carry strings and attempt to assign
   for(const item of carry){
-    const s = item.string;
-    const sbytes = latin1Bytes(s);
+    const s = item.string; const sbytes = latin1Bytes(s);
     let assigned = false;
 
-    // 1) find null slot >= len(s)+1 (for trailing null)
     for(let i=0;i<nullSlots.length;i++){
       const slot = nullSlots[i];
       if(slot.length >= sbytes.length + 1){
-        assignments.push({string:s, bytes:concatUint8(sbytes, new Uint8Array([0])), start: slot.start, slot_len: slot.length});
-        nullSlots.splice(i,1);
-        assigned = true;
-        break;
+        // write string and keep trailing null (do not zero extra beyond length)
+        assignments.push({string:s, bytes:concatUint8(sbytes, new Uint8Array([0])), start: slot.start, slot_len: slot.length, method: 'null-slot'});
+        nullSlots.splice(i,1); assigned = true; break;
       }
     }
     if(assigned) continue;
 
-    // 2) find printable slot length >= sbytes.length
     for(let i=0;i<printableSlots.length;i++){
       const slot = printableSlots[i];
       if(slot.length >= sbytes.length){
-        const padded = new Uint8Array(slot.length);
-        padded.set(sbytes);
-        // pad remainder with 0
-        assignments.push({string:s, bytes:padded, start: slot.start, slot_len: slot.length});
-        printableSlots.splice(i,1);
-        assigned = true;
-        break;
+        // if preserveTail: only overwrite sbytes.length bytes and leave the rest of the slot untouched
+        const writeLen = sbytes.length;
+        const payload = {string:s, bytes: sbytes, start: slot.start, slot_len: slot.length, write_len: writeLen, method: 'printable-slot'};
+        assignments.push(payload);
+        printableSlots.splice(i,1); assigned = true; break;
       }
     }
+    if(!assigned){ failures.push({string:s, length: sbytes.length}); }
+  }
 
-    if(!assigned){
-      failures.push({string:s, length: sbytes.length});
+  // Create merged copy
+  const merged = new Uint8Array(newBuf.slice(0));
+  for(const a of assignments){
+    if(a.method === 'null-slot'){
+      for(let i=0;i<a.bytes.length;i++) merged[a.start + i] = a.bytes[i];
+      // leave remainder of slot unchanged (recommended)
+    } else if(a.method === 'printable-slot'){
+      // Overwrite only write_len bytes (preserve tail bytes)
+      const len = a.write_len || a.bytes.length;
+      for(let i=0;i<len;i++) merged[a.start + i] = a.bytes[i];
+      // if preserveTail=false and slot larger, zero remainder (dangerous)
+      if(!preserveTail && a.slot_len > len){
+        for(let j = len; j < a.slot_len; j++) merged[a.start + j] = 0;
+      }
     }
   }
 
-  // Apply assignments to a copy of newBuf
-  const merged = new Uint8Array(newBuf.slice(0));
-  for(const a of assignments){
-    for(let i=0;i<a.bytes.length;i++) merged[a.start + i] = a.bytes[i];
-    // zero out remainder if slot bigger than bytes
-    for(let j=a.bytes.length;j<a.slot_len;j++) merged[a.start + j] = 0;
-  }
+  // Offer backup of original new file
+  if(offerBackup){
+    const backupLink = arrayBufferToBlobLink(newBuf.slice(0), fileNew.files[0].name + '.backup');
+    downloadBackup.href = backupLink.url; downloadBackup.style.display = 'inline-block'; downloadBackup.download = backupLink.filename;
+  } else { downloadBackup.style.display = 'none'; }
 
-  // Build report
-  const report = {
-    old_file: fileOld.files[0].name,
-    new_file: fileNew.files[0].name,
-    merged_size: merged.byteLength,
-    applied_count: assignments.length,
-    failed_count: failures.length,
-    applied: assignments.map(a => ({string: a.string, start: a.start, slot_len: a.slot_len})),
-    failed: failures
-  };
-
-  // Make download links
   const mergedLink = arrayBufferToBlobLink(merged.buffer, 'merged-metadata.dat');
+  const report = { old_file: fileOld.files[0].name, new_file: fileNew.files[0].name, merged_size: merged.byteLength, applied_count: assignments.length, failed_count: failures.length, applied: assignments.map(a=>({string:a.string, start:a.start, slot_len:a.slot_len, method:a.method})), failed: failures };
   const reportBlob = new Blob([JSON.stringify(report, null, 2)], {type:'application/json'});
   const reportUrl = URL.createObjectURL(reportBlob);
 
-  downloadMerged.href = mergedLink.url;
-  downloadMerged.style.display = 'inline-block';
-  downloadMerged.download = 'merged-metadata.dat';
-  downloadReport.href = reportUrl;
-  downloadReport.style.display = 'inline-block';
-  downloadReport.download = 'merge-report.json';
+  downloadMerged.href = mergedLink.url; downloadMerged.style.display = 'inline-block'; downloadMerged.download = 'merged-metadata.dat';
+  downloadReport.href = reportUrl; downloadReport.style.display = 'inline-block'; downloadReport.download = 'merge-report.json';
 
-  // Show summary
   reportBox.style.display = 'block';
   reportSummary.innerHTML = `<div><strong>Applied:</strong> ${report.applied_count} strings — <strong>Failed:</strong> ${report.failed_count} strings</div>`;
-  failedList.textContent = report.failed.slice(0,1000).map((f,i)=>`${i+1}. (${f.length}) ${f.string ?? '[binary]'}`).join('\n');
+  failedList.textContent = report.failed.slice(0,1000).map((f,i)=>`${i+1}. (${f.length}) ${f.string ?? '[binary]'}`).join('
+');
+
+  // Hex debug: show context around first applied change
+  if(report.applied.length){
+    const a = report.applied[0];
+    const ctxStart = Math.max(0, a.start - 32);
+    const ctxEnd = Math.min(merged.byteLength, a.start + Math.min(a.slot_len || 64, 128));
+    const slice = merged.subarray(ctxStart, ctxEnd);
+    hexDebug.textContent = hexdump(slice, ctxStart);
+  } else { hexDebug.textContent = 'No applied changes.'; }
 
   mergeResult.textContent = 'Done.';
 });
 
-// helpers
-function concatUint8(a,b){
-  const out = new Uint8Array(a.length + b.length);
-  out.set(a,0); out.set(b,a.length);
-  return out;
-}
-
+function concatUint8(a,b){ const out = new Uint8Array(a.length + b.length); out.set(a,0); out.set(b,a.length); return out; }
+function hexdump(bytes, base){ let hex = ''; for(let i=0;i<bytes.length;i+=16){ const slice = bytes.subarray(i, i+16); const off = (base + i).toString(16).padStart(8,'0'); const h = Array.from(slice).map(x=>x.toString(16).padStart(2,'0')).join(' '); let ascii = ''; for(let j=0;j<slice.length;j++){ const c = slice[j]; ascii += (c>=0x20 && c<=0x7E)? String.fromCharCode(c): '.'; } hex += off + '  ' + h.padEnd(47,' ') + '  ' + ascii + '
+'; } return hex; }
 </script>
 </body>
 </html>
